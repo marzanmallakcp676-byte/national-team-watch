@@ -55,7 +55,7 @@ def get_previous_snapshot():
 def load_history_csv():
     """从CSV加载历史数据"""
     if os.path.exists(HISTORY_CSV):
-        df = pd.read_csv(HISTORY_CSV)
+        df = pd.read_csv(HISTORY_CSV, dtype={"code": str})
         df["trade_date"] = pd.to_datetime(df["trade_date"].astype(str))
         return df
     return pd.DataFrame()

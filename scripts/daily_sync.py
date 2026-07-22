@@ -135,8 +135,9 @@ def main():
         print("  无新数据")
         return
 
-    # 7. 追加到历史CSV
+    # 确保code为字符串
     new_df = pd.DataFrame(new_records)
+    new_df["code"] = new_df["code"].astype(str)
 
     if history.empty:
         history = new_df
