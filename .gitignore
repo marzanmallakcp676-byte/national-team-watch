@@ -3,7 +3,7 @@ __pycache__/
 *.pyo
 ntw_data.db
 .DS_Store
-reports/
 *.egg-info/
 dist/
 .env
+# 注意: data/history.csv 需要提交到仓库（Streamlit Cloud 读取它）
