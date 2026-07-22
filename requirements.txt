@@ -1,0 +1,7 @@
+akshare>=1.14.0
+click>=8.1.0
+rich>=13.0.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+streamlit>=1.30.0
+plotly>=5.18.0
