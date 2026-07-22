@@ -313,7 +313,7 @@ with tab1:
     if not history_df.empty:
         tier1_etfs = [e for e in CORE_ETFS if e.tier == 1]
         fig_shares = go.Figure()
-        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+        colors = px.colors.qualitative.Dark24  # 24色自动循环
         for i, etf in enumerate(tier1_etfs):
             etf_hist = history_df[history_df["code"] == etf.code].sort_values("trade_date")
             if not etf_hist.empty and not etf_hist["shares"].isna().all():
@@ -324,7 +324,7 @@ with tab1:
                     fig_shares.add_trace(go.Scatter(
                         x=etf_hist["trade_date"], y=norm,
                         mode='lines', name=f"{etf.name}({etf.code})",
-                        line=dict(color=colors[i], width=2),
+                        line=dict(color=colors[i % len(colors)], width=2),
                     ))
         if fig_shares.data:
             fig_shares.update_layout(
