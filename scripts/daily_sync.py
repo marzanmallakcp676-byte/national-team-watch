@@ -135,13 +135,16 @@ def main():
         print("  无新数据")
         return
 
-    # 确保code为字符串
+    # 确保字符串类型
     new_df = pd.DataFrame(new_records)
     new_df["code"] = new_df["code"].astype(str)
+    new_df["trade_date"] = new_df["trade_date"].astype(str)
 
     if history.empty:
         history = new_df
     else:
+        history["code"] = history["code"].astype(str)
+        history["trade_date"] = history["trade_date"].astype(str)
         history = pd.concat([history, new_df], ignore_index=True)
 
     # 去重
