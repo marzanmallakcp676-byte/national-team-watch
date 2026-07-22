@@ -20,6 +20,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ntw.config import CORE_ETFS, ETF_MAP, SIGNAL_THRESHOLDS
 from ntw.fetcher import fetch_all_core_etf_data, fetch_sse_etf_shares, estimate_fund_flow
 
+# ── 北京时间 ──
+from zoneinfo import ZoneInfo
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+
+def beijing_now():
+    return datetime.now(BEIJING_TZ)
+
+def beijing_today_str():
+    return beijing_now().strftime("%Y%m%d")
+
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 HISTORY_CSV = os.path.join(DATA_DIR, "history.csv")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -27,29 +37,40 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # ── Live data fetcher (AKShare, no DB) ──
 @st.cache_data(ttl=3600)
 def get_live_snapshot(date_str=None):
-    """从 AKShare 实时获取ETF份额快照"""
+    """从 AKShare 实时获取ETF份额快照（北京时间）"""
     if date_str is None:
-        date_str = datetime.now().strftime("%Y%m%d")
-    return fetch_all_core_etf_data(target_date=date_str)
+        date_str = beijing_today_str()
+    data = fetch_all_core_etf_data(target_date=date_str)
+    # 如果今天数据还没出（T+1延迟），尝试昨天
+    if not any(d.get("shares") for d in data.values()):
+        yesterday = (beijing_now() - timedelta(days=1)).strftime("%Y%m%d")
+        data = fetch_all_core_etf_data(target_date=yesterday)
+    return data
 
 @st.cache_data(ttl=3600)
 def get_previous_snapshot():
-    """尝试获取前一日数据"""
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
-    # 尝试上交所数据
-    try:
-        df = fetch_sse_etf_shares(yesterday)
-        if df is not None and not df.empty:
-            prev = {}
-            for etf in CORE_ETFS:
-                if etf.exchange == "SSE":
-                    match = df[df["基金代码"].astype(str) == etf.code]
-                    if not match.empty:
-                        prev[etf.code] = float(match.iloc[0]["基金份额"]) / 10000
-            return prev
-    except:
-        pass
-    return {}
+    """获取前一交易日数据，用于计算变化"""
+    # 先获取当前已有数据的最新日期
+    live = fetch_all_core_etf_data(target_date=beijing_today_str())
+    has_data = any(d.get("shares") for d in live.values())
+
+    if has_data:
+        # 今天有数据，前一日就是昨天
+        ref = beijing_now() - timedelta(days=1)
+    else:
+        # 今天没数据，当前展示的是昨天，前一日就是前天
+        ref = beijing_now() - timedelta(days=2)
+
+    date_str = ref.strftime("%Y%m%d")
+    sse_df = fetch_sse_etf_shares(date_str)
+    prev = {}
+    if sse_df is not None and not sse_df.empty:
+        for etf in CORE_ETFS:
+            if etf.exchange == "SSE":
+                match = sse_df[sse_df["基金代码"].astype(str) == etf.code]
+                if not match.empty:
+                    prev[etf.code] = float(match.iloc[0]["基金份额"]) / 10000
+    return prev
 
 @st.cache_data(ttl=86400)
 def load_history_csv():
@@ -176,6 +197,7 @@ with st.sidebar:
     else:
         st.error("❌ 数据获取失败（非交易日或接口异常）")
 
+    st.caption(f"北京时间: {beijing_now().strftime('%Y-%m-%d %H:%M')}")
     st.caption("数据来源: AKShare (东方财富/上交所)")
     st.caption("缓存1小时 | 数据T+1更新")
     st.caption("⚠️ 仅供参考，不构成投资建议")
