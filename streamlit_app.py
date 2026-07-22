@@ -346,10 +346,11 @@ with tab2:
     code = etf_options[selected]
     etf = ETF_MAP[code]
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("交易所", etf.exchange)
     col2.metric("跟踪指数", etf.index_name)
     col3.metric("优先级", "核心" if etf.tier == 1 else "辅助")
+    col4.metric("使用者", etf.used_by)
 
     st.divider()
 
