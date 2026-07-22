@@ -135,8 +135,13 @@ def compute_latest_analysis():
                 nt_signal = "rotation"
                 signal_desc = f"疑似国家队轮动换仓：净差额较小，符合结构调整特征"
 
+    # 确定数据日期：优先用历史CSV最新日期
+    data_date = datetime.now().strftime("%Y-%m-%d")
+    if not history.empty:
+        data_date = history["trade_date"].max().strftime("%Y-%m-%d")
+
     return {
-        "trade_date": datetime.now().strftime("%Y-%m-%d"),
+        "trade_date": data_date,
         "etf_changes": sorted(changes, key=lambda x: abs(x["est_flow"]), reverse=True),
         "total_est_flow": round(total_flow, 2),
         "entry_count": entry_count,
@@ -186,14 +191,15 @@ with tab1:
     col_sig, col_flow, col_entry, col_exit = st.columns([2, 1, 1, 1])
 
     with col_sig:
+        data_date = analysis.get("trade_date", "")
         if analysis["national_team_signal"] == "none":
-            st.markdown(f'<div class="signal-none"><h3>🟡 无明显信号</h3><p>暂未检测到国家队大规模操作</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="signal-none"><h3>🟡 无明显信号</h3><p>数据日期: {data_date}</p><p>暂未检测到国家队大规模操作</p></div>', unsafe_allow_html=True)
         elif analysis["national_team_signal"] == "entry":
-            st.markdown(f'<div class="signal-entry"><h3>🔴 国家队护盘</h3><p>{analysis["signal_description"][:100]}</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="signal-entry"><h3>🔴 国家队护盘</h3><p style="font-size:14px">数据日期: {data_date}</p><p>{analysis["signal_description"][:100]}</p></div>', unsafe_allow_html=True)
         elif analysis["national_team_signal"] == "exit":
-            st.markdown(f'<div class="signal-exit"><h3>🟢 国家队减持</h3><p>{analysis["signal_description"][:100]}</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="signal-exit"><h3>🟢 国家队减持</h3><p style="font-size:14px">数据日期: {data_date}</p><p>{analysis["signal_description"][:100]}</p></div>', unsafe_allow_html=True)
         elif analysis["national_team_signal"] == "rotation":
-            st.markdown(f'<div class="signal-rotation"><h3>🟡 疑似轮动换仓</h3><p>{analysis["signal_description"][:100]}</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="signal-rotation"><h3>🟡 疑似轮动换仓</h3><p style="font-size:14px">数据日期: {data_date}</p><p>{analysis["signal_description"][:100]}</p></div>', unsafe_allow_html=True)
 
     with col_flow:
         st.metric("合计资金流", f'{analysis["total_est_flow"]:+.1f}亿')
@@ -202,7 +208,7 @@ with tab1:
     with col_exit:
         st.metric("退出ETF数", analysis["exit_count"])
 
-    st.caption("数据日期: 最新交易日 | 上交所ETF份额数据T+1更新 | 数据来源: AKShare")
+    st.caption(f"数据日期: {analysis.get('trade_date', '')} | 上交所ETF份额数据T+1更新 | 数据来源: AKShare")
 
     st.divider()
 
