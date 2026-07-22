@@ -248,9 +248,13 @@ with tab1:
                 sig = "🟢退出"
             else:
                 sig = "—"
+            # 获取使用者
+            etf_info = ETF_MAP.get(ch["code"])
+            used_by = etf_info.used_by if etf_info else "—"
             rows.append({
                 "日期": data_date,
                 "ETF": f'{ch["name"]} ({ch["code"]})',
+                "使用者": used_by,
                 "份额(万份)": f'{ch["shares"]:,.0f}',
                 "变化(万份)": f'{ch["shares_change"]:+,.0f}',
                 "变化率": f'{ch["shares_change_pct"]:+.2f}%',
