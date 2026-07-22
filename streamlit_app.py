@@ -239,6 +239,7 @@ with tab1:
     if changes:
         st.subheader("核心宽基ETF份额变化明细")
 
+        data_date = analysis.get("trade_date", "")
         rows = []
         for ch in changes:
             if ch["signal"] == "entry":
@@ -248,6 +249,7 @@ with tab1:
             else:
                 sig = "—"
             rows.append({
+                "日期": data_date,
                 "ETF": f'{ch["name"]} ({ch["code"]})',
                 "份额(万份)": f'{ch["shares"]:,.0f}',
                 "变化(万份)": f'{ch["shares_change"]:+,.0f}',
