@@ -157,9 +157,16 @@ def compute_latest_analysis():
                 nt_signal = "rotation"
                 signal_desc = f"疑似国家队轮动换仓：净差额较小，符合结构调整特征"
 
-    # 确定数据日期：优先用历史CSV最新日期
-    data_date = datetime.now().strftime("%Y-%m-%d")
-    if not history.empty:
+    # 确定数据日期：优先用实时AKShare数据日期
+    # AKShare实时数据T+1 → 最新可用日期 ≈ 昨天
+    data_date = beijing_now().strftime("%Y-%m-%d")
+    if has_live_data := any(d.get("shares") for d in live.values() if d):
+        # 实时数据有内容，但可能是昨天的（T+1），用历史CSV确认最新交易日期
+        if not history.empty:
+            csv_max = history["trade_date"].max().strftime("%Y-%m-%d")
+            data_date = csv_max  # CSV里最新那天就是数据日期
+    # 如果实时数据和CSV都没更新（比如周末），至少显示CSV最新日期
+    elif not history.empty:
         data_date = history["trade_date"].max().strftime("%Y-%m-%d")
 
     return {
