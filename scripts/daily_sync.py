@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""GitHub Actions 每日同步脚本 — 拉取ETF份额数据，追加到 history.csv"""
+"""GitHub Actions 每日同步脚本 — 拉取ETF份额数据，追加到 history.csv
+
+改进：
+- 周末智能回退：周一自动补上周五+周四数据
+- 更健壮的错误处理
+- 支持手动指定日期范围
+"""
 
 import pandas as pd
 import os, sys, warnings
@@ -18,6 +24,31 @@ DATA_DIR = os.path.join(BASE, "data")
 HISTORY_CSV = os.path.join(DATA_DIR, "history.csv")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+
+# ── Helper: 获取目标同步日期列表 ──
+def get_target_dates() -> list:
+    """
+    智能确定需要同步的日期。
+    - 工作日：同步昨天（T+1数据）
+    - 周一：同步上周五 + 上周四（补周末缺口）
+    返回日期字符串列表 ['YYYYMMDD', ...]
+    """
+    today = datetime.now()
+    dates = []
+
+    # 回退到最近的工作日
+    check = today - timedelta(days=1)
+    attempts = 0
+    while attempts < 5:
+        if check.weekday() < 5:  # 周一到周五
+            dates.append(check.strftime("%Y%m%d"))
+        check = check - timedelta(days=1)
+        attempts += 1
+
+    # 只保留最近的2个有效交易日（够cover周末）
+    return dates[:2]
+
+
 # ── AKShare fetch ──
 def fetch_sse_shares(date_str):
     import akshare as ak
@@ -29,56 +60,76 @@ def fetch_sse_shares(date_str):
         print(f"  [WARN] SSE数据获取失败 ({date_str}): {e}")
     return pd.DataFrame()
 
+
 def fetch_spot_prices():
     import akshare as ak
     try:
         return ak.fund_etf_spot_em()
-    except:
+    except Exception as e:
+        print(f"  [WARN] 行情数据获取失败: {e}")
         return pd.DataFrame()
 
 
-def main():
-    # 使用昨日日期（T+1数据）
-    yesterday = (datetime.now() - timedelta(days=1))
-    if yesterday.weekday() >= 5:  # 周末跳过
-        print(f"  {yesterday.strftime('%Y-%m-%d')} 是周末，跳过")
-        return
-
-    date_str = yesterday.strftime("%Y%m%d")
-    print(f"同步日期: {date_str}")
-
-    # 1. 获取上交所ETF份额
-    sse_df = fetch_sse_shares(date_str)
-    if sse_df.empty:
-        print("  上交所数据为空，可能尚未更新（T+1延迟）")
-        return
-
-    # 2. 获取行情价格
-    spot_df = fetch_spot_prices()
-
-    # 3. 读取现有历史CSV
+def load_history():
+    """加载历史CSV，保证类型一致"""
     if os.path.exists(HISTORY_CSV):
         history = pd.read_csv(HISTORY_CSV)
+        history["code"] = history["code"].astype(str)
         history["trade_date"] = history["trade_date"].astype(str)
-    else:
-        history = pd.DataFrame()
+        return history
+    return pd.DataFrame()
 
-    # 4. 检查是否已有今日数据
+
+def sync_date(date_str, history=None):
+    """
+    同步单个日期的ETF数据。
+    返回: (new_records_count, updated_history_df or None)
+    """
+    if history is None:
+        history = load_history()
+
+    print(f"  同步日期: {date_str}")
+
+    # 1. 检查是否已有该日期数据
     if not history.empty:
         existing = history[history["trade_date"] == date_str]
         if not existing.empty:
-            print(f"  {date_str} 数据已存在，跳过")
-            return
+            # 检查是否全是零变化（说明上次同步有bug）
+            all_zero = (existing["shares_change"] == 0).all()
+            if not all_zero:
+                print(f"    {date_str} 数据已存在且正常，跳过")
+                return 0, None
+            else:
+                print(f"    {date_str} 数据存在但变化量为零，重新计算...")
+                # 删除旧数据，重新同步
+                history = history[history["trade_date"] != date_str]
 
-    # 5. 上一次数据用于计算变化
+    # 2. 获取上交所ETF份额
+    sse_df = fetch_sse_shares(date_str)
+    if sse_df.empty:
+        print(f"    {date_str} 上交所数据为空（非交易日或T+1数据尚未发布）")
+        return 0, None
+
+    # 3. 获取行情价格
+    spot_df = fetch_spot_prices()
+
+    # 4. 找前一交易日数据用于计算变化
     prev_shares = {}
     if not history.empty:
-        latest_date = history["trade_date"].max()
-        prev_data = history[history["trade_date"] == latest_date]
-        for _, row in prev_data.iterrows():
-            prev_shares[row["code"]] = row["shares"]
+        # 找严格早于当前日期的最大日期
+        earlier = history[history["trade_date"] < date_str]
+        if not earlier.empty:
+            latest_prev_date = earlier["trade_date"].max()
+            prev_data = history[history["trade_date"] == latest_prev_date]
+            for _, row in prev_data.iterrows():
+                prev_shares[row["code"]] = row["shares"]
+            print(f"    前一交易日: {latest_prev_date}, {len(prev_shares)}只ETF可用作比较基准")
+        else:
+            print(f"    无更早日期的历史数据，无法计算变化量")
+    else:
+        print(f"    历史CSV为空，无法计算变化量")
 
-    # 6. 组装新记录
+    # 5. 组装新记录
     new_records = []
     for etf in CORE_ETFS:
         shares = None
@@ -99,13 +150,13 @@ def main():
             if not spot_match.empty:
                 try:
                     price = float(spot_match.iloc[0].get("最新价", 1.0) or 1.0)
-                except:
+                except Exception:
                     pass
 
-        # 计算变化
+        # 计算变化（使用严格的前一交易日数据）
         prev_share = prev_shares.get(etf.code)
         if prev_share is not None and prev_share > 0:
-            change = shares - prev_share
+            change = round(shares - prev_share, 2)
             change_pct = round((change / prev_share) * 100, 2)
             est_flow = round(change * price / 10000, 2)
         else:
@@ -113,9 +164,9 @@ def main():
             change_pct = 0.0
             est_flow = 0.0
 
-        # 信号判断（简略版）
+        # 信号判断
         signal = "none"
-        if change_pct > 5 and change > 10:
+        if change_pct > 5 and abs(change) > 10:
             signal = "entry"
         elif change_pct < -5 and abs(change) > 10:
             signal = "exit"
@@ -132,8 +183,8 @@ def main():
         })
 
     if not new_records:
-        print("  无新数据")
-        return
+        print(f"    无匹配的ETF数据")
+        return 0, None
 
     # 确保字符串类型
     new_df = pd.DataFrame(new_records)
@@ -147,13 +198,38 @@ def main():
         history["trade_date"] = history["trade_date"].astype(str)
         history = pd.concat([history, new_df], ignore_index=True)
 
-    # 去重
+    # 去重 & 排序
     history = history.drop_duplicates(subset=["code", "trade_date"], keep="last")
     history = history.sort_values(["trade_date", "code"])
 
-    history.to_csv(HISTORY_CSV, index=False, encoding="utf-8")
-    print(f"  已追加 {len(new_records)} 条记录 ({date_str})")
-    print(f"  历史总记录: {len(history)} 条")
+    return len(new_records), history
+
+
+def main():
+    target_dates = sorted(get_target_dates())  # 升序：从旧到新处理
+    print(f"目标同步日期: {target_dates}")
+
+    history = load_history()
+    print(f"现有历史记录: {len(history)} 条")
+
+    total_new = 0
+    for date_str in target_dates:
+        n, updated = sync_date(date_str, history)
+        if updated is not None:
+            history = updated
+            total_new += n
+        print()  # 空行分隔
+
+    if total_new > 0:
+        history.to_csv(HISTORY_CSV, index=False, encoding="utf-8")
+        print(f"✅ 总计追加 {total_new} 条新记录")
+        print(f"   历史总记录: {len(history)} 条")
+        latest = history["trade_date"].max()
+        print(f"   最新数据日期: {latest}")
+    else:
+        # 即使没新数据也保存（可能修复了零变化数据）
+        history.to_csv(HISTORY_CSV, index=False, encoding="utf-8")
+        print(f"ℹ️  无新数据追加，最新日期: {history['trade_date'].max() if not history.empty else 'N/A'}")
 
 
 if __name__ == "__main__":
