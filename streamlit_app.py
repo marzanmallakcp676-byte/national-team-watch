@@ -37,41 +37,18 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 # ── Live data fetcher (AKShare, no DB) ──
 @st.cache_data(ttl=3600)
-def get_live_snapshot(date_str=None):
-    """从 AKShare 实时获取ETF份额快照（北京时间）"""
-    if date_str is None:
-        date_str = beijing_today_str()
-    data = fetch_all_core_etf_data(target_date=date_str)
+def get_live_snapshot():
+    """从 AKShare 实时获取ETF份额快照，返回 (data, actual_date_str)"""
+    today_str = beijing_today_str()
+    data = fetch_all_core_etf_data(target_date=today_str)
+    actual_date = today_str
     # 如果今天数据还没出（T+1延迟），尝试昨天
     if not any(d.get("shares") for d in data.values()):
         yesterday = (beijing_now() - timedelta(days=1)).strftime("%Y%m%d")
         data = fetch_all_core_etf_data(target_date=yesterday)
-    return data
+        actual_date = yesterday
+    return data, actual_date
 
-@st.cache_data(ttl=3600)
-def get_previous_snapshot():
-    """获取前一交易日数据，用于计算变化"""
-    # 先获取当前已有数据的最新日期
-    live = fetch_all_core_etf_data(target_date=beijing_today_str())
-    has_data = any(d.get("shares") for d in live.values())
-
-    if has_data:
-        # 今天有数据，前一日就是昨天
-        ref = beijing_now() - timedelta(days=1)
-    else:
-        # 今天没数据，当前展示的是昨天，前一日就是前天
-        ref = beijing_now() - timedelta(days=2)
-
-    date_str = ref.strftime("%Y%m%d")
-    sse_df = fetch_sse_etf_shares(date_str)
-    prev = {}
-    if sse_df is not None and not sse_df.empty:
-        for etf in CORE_ETFS:
-            if etf.exchange == "SSE":
-                match = sse_df[sse_df["基金代码"].astype(str) == etf.code]
-                if not match.empty:
-                    prev[etf.code] = float(match.iloc[0]["基金份额"]) / 10000
-    return prev
 
 @st.cache_data(ttl=86400)
 def load_history_csv():
@@ -82,12 +59,36 @@ def load_history_csv():
         return df
     return pd.DataFrame()
 
+
+def get_prev_shares_from_csv(live_date_str, history):
+    """
+    从历史CSV获取 live_date 前一交易日的份额数据。
+    不再依赖AKShare实时API，直接用CSV已同步的可靠数据。
+    """
+    if history.empty:
+        return {}, None
+
+    live_ts = pd.Timestamp(live_date_str)
+    earlier = history[history["trade_date"] < live_ts]
+    if earlier.empty:
+        return {}, None
+
+    prev_date = earlier["trade_date"].max()
+    prev_data = history[history["trade_date"] == prev_date]
+    prev_shares = {}
+    for _, row in prev_data.iterrows():
+        prev_shares[row["code"]] = row["shares"]
+
+    return prev_shares, prev_date.strftime("%Y-%m-%d")
+
 # ── Compute analysis from live + history ──
 def compute_latest_analysis():
     """综合实时数据和历史CSV，计算最新分析"""
-    live = get_live_snapshot()
-    prev = get_previous_snapshot()
+    live, live_date = get_live_snapshot()
     history = load_history_csv()
+
+    # 从CSV获取前一交易日份额（可靠，不受AKShare实时API波动影响）
+    prev_shares, prev_date_label = get_prev_shares_from_csv(live_date, history)
 
     # 组装ETF变化
     changes = []
@@ -104,14 +105,8 @@ def compute_latest_analysis():
         if cur_shares is None:
             continue
 
-        # 优先使用前一日快照，其次用历史CSV
-        prev_share = prev.get(code)
-        if prev_share is None and not history.empty and code in history.columns:
-            hist_for_code = history[history["code"] == code]
-            if not hist_for_code.empty:
-                latest_hist = hist_for_code.sort_values("trade_date").iloc[-1]
-                prev_share = latest_hist.get("shares")
-
+        # 使用CSV前一交易日数据计算变化
+        prev_share = prev_shares.get(code)
         if prev_share is not None and prev_share > 0:
             change = cur_shares - prev_share
             change_pct = (change / prev_share) * 100
@@ -198,8 +193,8 @@ with st.sidebar:
     days = st.slider("历史回溯天数", 7, 180, 60, 7)
 
     st.divider()
-    data_date = get_live_snapshot()
-    has_live = any(d.get("shares") for d in data_date.values())
+    live_check, _ = get_live_snapshot()
+    has_live = any(d.get("shares") for d in live_check.values())
     if has_live:
         st.success("✅ 实时数据连接正常")
     else:
@@ -416,7 +411,7 @@ with tab2:
     # ── Current snapshot for this ETF ──
     st.divider()
     st.subheader("最新快照")
-    live = get_live_snapshot()
+    live, _ = get_live_snapshot()
     d = live.get(code, {})
     if d.get("shares"):
         st.metric("当前份额", f'{d["shares"]:,.0f}万份')
