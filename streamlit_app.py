@@ -19,7 +19,7 @@ st.set_page_config(
 # ── Path setup ──
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ntw.config import CORE_ETFS, ETF_MAP, SIGNAL_THRESHOLDS
-from ntw.fetcher import fetch_all_core_etf_data, fetch_sse_etf_shares, estimate_fund_flow
+from ntw.fetcher import fetch_latest_core_etf_data, fetch_sse_etf_shares, estimate_fund_flow
 
 # ── 北京时间 ──
 from zoneinfo import ZoneInfo
@@ -35,27 +35,141 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 HISTORY_CSV = os.path.join(DATA_DIR, "history.csv")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# ── 自动同步最新数据 ──
+def auto_sync_latest():
+    """
+    App启动时自动拉取缺失的ETF份额数据并追加到history.csv。
+    回看最近14天内所有工作日并逐日补缺（覆盖周末/长假/多日未打开造成的缺口），
+    按日期升序同步，每个日期以上一个已同步日期为基准计算变化量。
+    返回: 同步后的最新数据日期 (YYYYMMDD str)
+    """
+    import akshare as ak
+
+    # 最近14天内的工作日（升序）
+    candidates = []
+    check = beijing_now()
+    for _ in range(14):
+        if check.weekday() < 5:
+            candidates.append(check.strftime("%Y%m%d"))
+        check = check - timedelta(days=1)
+    candidates.sort()
+
+    # 加载现有历史（统一为 YYYYMMDD 字符串，字典序即时间序）
+    history = load_history_csv()
+    if not history.empty:
+        history["trade_date"] = history["trade_date"].dt.strftime("%Y%m%d")
+        history["code"] = history["code"].astype(str)
+    existing_dates = set(history["trade_date"]) if not history.empty else set()
+
+    # 获取行情价格（一次调用，所有日期共用）
+    spot_df = pd.DataFrame()
+    try:
+        spot_df = ak.fund_etf_spot_em()
+    except Exception:
+        pass
+
+    new_count = 0
+    for date_str in candidates:
+        if date_str in existing_dates:
+            continue
+        # 带超时与空数据容错的直接实现（akshare 无超时且空日期会抛 KeyError）
+        sse_df = fetch_sse_etf_shares(date_str)
+        if sse_df.empty:
+            continue
+
+        # 基准 = 已累计历史（含本次运行已同步的日期）中严格早于本日的最近一天
+        prev_shares = {}
+        if not history.empty:
+            earlier = history[history["trade_date"] < date_str]
+            if not earlier.empty:
+                prev_date = earlier["trade_date"].max()
+                for _, row in history[history["trade_date"] == prev_date].iterrows():
+                    prev_shares[row["code"]] = row["shares"]
+
+        new_rows = []
+        for etf in CORE_ETFS:
+            if etf.exchange != "SSE":
+                continue
+            match = sse_df[sse_df["基金代码"].astype(str) == etf.code]
+            if match.empty:
+                match = sse_df[sse_df["基金代码"].astype(str).str.contains(etf.code, na=False)]
+            if match.empty:
+                continue
+
+            shares = float(match.iloc[0]["基金份额"]) / 10000
+            price = 1.0
+            if not spot_df.empty:
+                spot_match = spot_df[spot_df["代码"].astype(str) == etf.code]
+                if not spot_match.empty:
+                    try:
+                        price = float(spot_match.iloc[0].get("最新价", 1.0) or 1.0)
+                    except Exception:
+                        pass
+
+            prev_share = prev_shares.get(etf.code)
+            if prev_share is not None and prev_share > 0:
+                change = round(shares - prev_share, 2)
+                change_pct = round((change / prev_share) * 100, 2)
+                est_flow = round(change * price / 10000, 2)
+            else:
+                change, change_pct, est_flow = 0.0, 0.0, 0.0
+
+            signal = "none"
+            if change_pct > 5 and abs(change) > 10:
+                signal = "entry"
+            elif change_pct < -5 and abs(change) > 10:
+                signal = "exit"
+
+            new_rows.append({
+                "code": etf.code, "trade_date": date_str,
+                "shares": shares, "price": price,
+                "shares_change": change, "shares_change_pct": change_pct,
+                "est_flow": est_flow, "signal": signal,
+            })
+
+        if new_rows:
+            new_df = pd.DataFrame(new_rows)
+            new_df["code"] = new_df["code"].astype(str)
+            new_df["trade_date"] = new_df["trade_date"].astype(str)
+            history = pd.concat([history, new_df], ignore_index=True)
+            existing_dates.add(date_str)
+            new_count += len(new_rows)
+
+    # 追加到CSV
+    if new_count:
+        history = history.drop_duplicates(subset=["code", "trade_date"], keep="last")
+        history = history.sort_values(["trade_date", "code"])
+        history.to_csv(HISTORY_CSV, index=False, encoding="utf-8")
+        # 清除缓存，让 load_history_csv 重新加载
+        load_history_csv.clear()
+        print(f"🔄 自动同步: 新增 {new_count} 条记录")
+
+    # 返回最新数据日期
+    final_history = load_history_csv()
+    if not final_history.empty:
+        return final_history["trade_date"].max().strftime("%Y%m%d")
+    return beijing_today_str()
+
+
 # ── Live data fetcher (AKShare, no DB) ──
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=1800)
 def get_live_snapshot():
-    """从 AKShare 实时获取ETF份额快照，返回 (data, actual_date_str)"""
+    """
+    从 AKShare 实时获取ETF份额快照，返回 (data, actual_date_str)。
+    上交所份额数据 T+1 发布：周日/周一晚间及长假期间当天数据未出，
+    自动回退最多10天找最近一个有数据的交易日。
+    """
     today_str = beijing_today_str()
-    data = fetch_all_core_etf_data(target_date=today_str)
-    actual_date = today_str
-    # 如果今天数据还没出（T+1延迟），尝试昨天
-    if not any(d.get("shares") for d in data.values()):
-        yesterday = (beijing_now() - timedelta(days=1)).strftime("%Y%m%d")
-        data = fetch_all_core_etf_data(target_date=yesterday)
-        actual_date = yesterday
-    return data, actual_date
+    return fetch_latest_core_etf_data(start_date=today_str, max_back_days=10)
 
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=600)
 def load_history_csv():
-    """从CSV加载历史数据"""
+    """从CSV加载历史数据（缓存10分钟）"""
     if os.path.exists(HISTORY_CSV):
         df = pd.read_csv(HISTORY_CSV, dtype={"code": str})
-        df["trade_date"] = pd.to_datetime(df["trade_date"].astype(str))
+        # format='mixed' 处理 CSV 中 "2026-07-27" 和 "20260728" 混存的兼容
+        df["trade_date"] = pd.to_datetime(df["trade_date"].astype(str), format="mixed")
         return df
     return pd.DataFrame()
 
@@ -84,6 +198,9 @@ def get_prev_shares_from_csv(live_date_str, history):
 # ── Compute analysis from live + history ──
 def compute_latest_analysis():
     """综合实时数据和历史CSV，计算最新分析"""
+    # 🔧 启动时自动同步最新数据（解决本地不自动更新的问题）
+    latest_csv_date = auto_sync_latest()
+
     live, live_date = get_live_snapshot()
     history = load_history_csv()
 
@@ -96,43 +213,70 @@ def compute_latest_analysis():
     entry_count = 0
     exit_count = 0
 
-    for etf in CORE_ETFS:
-        code = etf.code
-        data = live.get(code, {})
-        cur_shares = data.get("shares")
-        price = data.get("price") or data.get("nav") or 1.0
+    has_live_shares = any((d or {}).get("shares") for d in live.values())
+    if has_live_shares:
+        for etf in CORE_ETFS:
+            code = etf.code
+            data = live.get(code, {})
+            cur_shares = data.get("shares")
+            price = data.get("price") or data.get("nav") or 1.0
 
-        if cur_shares is None:
-            continue
+            if cur_shares is None:
+                continue
 
-        # 使用CSV前一交易日数据计算变化
-        prev_share = prev_shares.get(code)
-        if prev_share is not None and prev_share > 0:
-            change = cur_shares - prev_share
-            change_pct = (change / prev_share) * 100
-            est_flow = estimate_fund_flow(change, price)
-        else:
-            change = 0
-            change_pct = 0.0
-            est_flow = 0.0
+            # 使用CSV前一交易日数据计算变化
+            prev_share = prev_shares.get(code)
+            if prev_share is not None and prev_share > 0:
+                change = cur_shares - prev_share
+                change_pct = (change / prev_share) * 100
+                est_flow = estimate_fund_flow(change, price)
+            else:
+                change = 0
+                change_pct = 0.0
+                est_flow = 0.0
 
-        # 信号判断
-        signal = "none"
-        if change_pct > SIGNAL_THRESHOLDS["entry_share_pct"] and change > SIGNAL_THRESHOLDS["entry_share_abs"]:
-            signal = "entry"
-        elif change_pct < -SIGNAL_THRESHOLDS["entry_share_pct"] and abs(change) > SIGNAL_THRESHOLDS["entry_share_abs"]:
-            signal = "exit"
+            # 信号判断
+            signal = "none"
+            if change_pct > SIGNAL_THRESHOLDS["entry_share_pct"] and change > SIGNAL_THRESHOLDS["entry_share_abs"]:
+                signal = "entry"
+            elif change_pct < -SIGNAL_THRESHOLDS["entry_share_pct"] and abs(change) > SIGNAL_THRESHOLDS["entry_share_abs"]:
+                signal = "exit"
 
-        changes.append({
-            "code": code, "name": etf.name, "shares": cur_shares,
-            "shares_change": change, "shares_change_pct": round(change_pct, 2),
-            "price": price, "est_flow": round(est_flow, 2), "signal": signal,
-        })
-        total_flow += est_flow
-        if signal == "entry":
-            entry_count += 1
-        elif signal == "exit":
-            exit_count += 1
+            changes.append({
+                "code": code, "name": etf.name, "shares": cur_shares,
+                "shares_change": change, "shares_change_pct": round(change_pct, 2),
+                "price": price, "est_flow": round(est_flow, 2), "signal": signal,
+            })
+            total_flow += est_flow
+            if signal == "entry":
+                entry_count += 1
+            elif signal == "exit":
+                exit_count += 1
+    elif not history.empty:
+        # live 全空（长假/接口异常）：降级用 history.csv 最新交易日已算好的数据渲染，
+        # 保证面板始终有内容而不是空白
+        latest_dt = history["trade_date"].max()
+        latest_rows = history[history["trade_date"] == latest_dt]
+        for _, row in latest_rows.iterrows():
+            etf_info = ETF_MAP.get(row["code"])
+            if etf_info is None:
+                continue
+            signal = row.get("signal", "none")
+            changes.append({
+                "code": row["code"], "name": etf_info.name,
+                "shares": float(row["shares"]),
+                "shares_change": float(row["shares_change"]),
+                "shares_change_pct": round(float(row["shares_change_pct"]), 2),
+                "price": float(row["price"]),
+                "est_flow": float(row["est_flow"]),
+                "signal": signal,
+            })
+            total_flow += float(row["est_flow"])
+            if signal == "entry":
+                entry_count += 1
+            elif signal == "exit":
+                exit_count += 1
+        live_date = latest_dt.strftime("%Y%m%d")  # 使下方 data_date 显示 CSV 最新交易日
 
     # 综合判断
     nt_signal = "none"
@@ -152,20 +296,28 @@ def compute_latest_analysis():
                 nt_signal = "rotation"
                 signal_desc = f"疑似国家队轮动换仓：净差额较小，符合结构调整特征"
 
-    # 确定数据日期：优先用实时AKShare数据日期
-    # AKShare实时数据T+1 → 最新可用日期 ≈ 昨天
-    data_date = beijing_now().strftime("%Y-%m-%d")
-    if has_live_data := any(d.get("shares") for d in live.values() if d):
-        # 实时数据有内容，但可能是昨天的（T+1），用历史CSV确认最新交易日期
-        if not history.empty:
-            csv_max = history["trade_date"].max().strftime("%Y-%m-%d")
-            data_date = csv_max  # CSV里最新那天就是数据日期
-    # 如果实时数据和CSV都没更新（比如周末），至少显示CSV最新日期
+    # 确定数据日期
+    # live_date 是 YYYYMMDD 格式（如 "20260728"），统一转为 YYYY-MM-DD
+    has_live = any(d.get("shares") for d in live.values() if d)
+    if has_live:
+        # 把 YYYYMMDD → YYYY-MM-DD
+        data_date = f"{live_date[:4]}-{live_date[4:6]}-{live_date[6:8]}"
     elif not history.empty:
         data_date = history["trade_date"].max().strftime("%Y-%m-%d")
+    else:
+        data_date = beijing_now().strftime("%Y-%m-%d")
+
+    # 格式化显示
+    today_display = beijing_now().strftime("%Y-%m-%d")
+    if data_date != today_display:
+        data_date_display = f"{data_date}（最新交易日）"
+    else:
+        data_date_display = data_date
 
     return {
         "trade_date": data_date,
+        "trade_date_display": data_date_display,
+        "beijing_today": today_display,
         "etf_changes": sorted(changes, key=lambda x: abs(x["est_flow"]), reverse=True),
         "total_est_flow": round(total_flow, 2),
         "entry_count": entry_count,
@@ -200,9 +352,14 @@ with st.sidebar:
     else:
         st.error("❌ 数据获取失败（非交易日或接口异常）")
 
-    st.caption(f"北京时间: {beijing_now().strftime('%Y-%m-%d %H:%M')}")
+    st.caption(f"🕐 北京时间: {beijing_now().strftime('%Y-%m-%d %H:%M')}")
+    # 显示最新数据日期
+    latest_hist = load_history_csv()
+    if not latest_hist.empty:
+        latest_data_dt = latest_hist["trade_date"].max().strftime("%Y-%m-%d")
+        st.caption(f"📊 最新数据: {latest_data_dt}")
     st.caption("数据来源: AKShare (东方财富/上交所)")
-    st.caption("缓存1小时 | 数据T+1更新")
+    st.caption("启动时自动同步 | 数据T+1更新")
     st.caption("⚠️ 仅供参考，不构成投资建议")
 
 # ═══════════════════════ PAGE 1: OVERVIEW ═══════════════════════
@@ -216,15 +373,15 @@ with tab1:
     col_sig, col_flow, col_entry, col_exit = st.columns([2, 1, 1, 1])
 
     with col_sig:
-        data_date = analysis.get("trade_date", "")
+        data_date_display = analysis.get("trade_date_display", "")
         if analysis["national_team_signal"] == "none":
-            st.markdown(f'<div class="signal-none"><h3>🟡 无明显信号</h3><p>数据日期: {data_date}</p><p>暂未检测到国家队大规模操作</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="signal-none"><h3>🟡 无明显信号</h3><p>📅 {data_date_display}</p><p>暂未检测到国家队大规模操作</p></div>', unsafe_allow_html=True)
         elif analysis["national_team_signal"] == "entry":
-            st.markdown(f'<div class="signal-entry"><h3>🔴 国家队护盘</h3><p style="font-size:14px">数据日期: {data_date}</p><p>{analysis["signal_description"][:100]}</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="signal-entry"><h3>🔴 国家队护盘</h3><p style="font-size:14px">📅 {data_date_display}</p><p>{analysis["signal_description"][:100]}</p></div>', unsafe_allow_html=True)
         elif analysis["national_team_signal"] == "exit":
-            st.markdown(f'<div class="signal-exit"><h3>🟢 国家队减持</h3><p style="font-size:14px">数据日期: {data_date}</p><p>{analysis["signal_description"][:100]}</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="signal-exit"><h3>🟢 国家队减持</h3><p style="font-size:14px">📅 {data_date_display}</p><p>{analysis["signal_description"][:100]}</p></div>', unsafe_allow_html=True)
         elif analysis["national_team_signal"] == "rotation":
-            st.markdown(f'<div class="signal-rotation"><h3>🟡 疑似轮动换仓</h3><p style="font-size:14px">数据日期: {data_date}</p><p>{analysis["signal_description"][:100]}</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="signal-rotation"><h3>🟡 疑似轮动换仓</h3><p style="font-size:14px">📅 {data_date_display}</p><p>{analysis["signal_description"][:100]}</p></div>', unsafe_allow_html=True)
 
     with col_flow:
         st.metric("合计资金流", f'{analysis["total_est_flow"]:+.1f}亿')
@@ -233,7 +390,7 @@ with tab1:
     with col_exit:
         st.metric("退出ETF数", analysis["exit_count"])
 
-    st.caption(f"数据日期: {analysis.get('trade_date', '')} | 上交所ETF份额数据T+1更新 | 数据来源: AKShare")
+    st.caption(f"📅 数据日期: {analysis.get('trade_date_display', '')} | 上交所ETF份额每日更新 | 数据来源: AKShare")
 
     st.divider()
 
@@ -242,7 +399,7 @@ with tab1:
     if changes:
         st.subheader("核心宽基ETF份额变化明细")
 
-        data_date = analysis.get("trade_date", "")
+        data_date = analysis.get("trade_date_display", "")
         rows = []
         for ch in changes:
             if ch["signal"] == "entry":

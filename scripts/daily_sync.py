@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """GitHub Actions 每日同步脚本 — 拉取ETF份额数据，追加到 history.csv
 
-改进：
-- 周末智能回退：周一自动补上周五+周四数据
+晚间运行，交易日当天收盘后同步当日数据（T+0）。
+- 自动回退：当天数据未发布时自动取最近交易日
 - 更健壮的错误处理
 - 支持手动指定日期范围
 """
@@ -29,15 +29,15 @@ os.makedirs(DATA_DIR, exist_ok=True)
 def get_target_dates() -> list:
     """
     智能确定需要同步的日期。
-    - 工作日：同步昨天（T+1数据）
+    - 工作日：同步当天（T+0数据）
     - 周一：同步上周五 + 上周四（补周末缺口）
     返回日期字符串列表 ['YYYYMMDD', ...]
     """
     today = datetime.now()
     dates = []
 
-    # 回退到最近的工作日
-    check = today - timedelta(days=1)
+    # 从今天开始查（晚间运行，当天数据已发布）
+    check = today
     attempts = 0
     while attempts < 5:
         if check.weekday() < 5:  # 周一到周五
@@ -51,14 +51,9 @@ def get_target_dates() -> list:
 
 # ── AKShare fetch ──
 def fetch_sse_shares(date_str):
-    import akshare as ak
-    try:
-        df = ak.fund_etf_scale_sse(date=date_str)
-        if df is not None and not df.empty:
-            return df
-    except Exception as e:
-        print(f"  [WARN] SSE数据获取失败 ({date_str}): {e}")
-    return pd.DataFrame()
+    # 复用 ntw.fetcher 的稳健实现：带超时、无数据日期返回空表而不是抛 KeyError
+    from ntw.fetcher import fetch_sse_etf_shares
+    return fetch_sse_etf_shares(date_str)
 
 
 def fetch_spot_prices():
